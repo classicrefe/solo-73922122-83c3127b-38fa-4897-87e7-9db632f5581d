@@ -27,6 +27,10 @@
     .btn-start { background: var(--green); color: #052e1f; }
     .btn-stop { background: var(--red); color: #3b0a0a; }
     .btn-download { background: var(--accent); color: #08233a; }
+    .btn-deliver { background: #a78bfa; color: #1e1b4b; }
+    .btn-retry { background: #fbbf24; color: #422006; padding: 6px 12px; font-size: 12px; }
+    .btn-mini { background: #475569; color: #fff; padding: 6px 12px; font-size: 12px; }
+    .mono { font-family: ui-monospace, monospace; font-size: 12px; }
     .btn-site { background: #475569; color: #fff; text-decoration: none;
                 padding: 10px 18px; border-radius: 8px; font-size: 14px; font-weight: 600; }
     .badge { display: inline-block; padding: 4px 12px; border-radius: 999px;
@@ -37,6 +41,9 @@
     .badge.stopped { background: #b91c1c; }
     .badge.completed { background: #047857; }
     .badge.partial { background: #a16207; }
+    .badge.pending { background: #b45309; }
+    .badge.delivered { background: #047857; }
+    .badge.rejected { background: #b91c1c; }
     .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
     .stat { background: #0b1220; border: 1px solid var(--line); border-radius: 8px;
             padding: 12px 14px; }
@@ -61,6 +68,8 @@
     .muted { color: var(--muted); font-size: 12px; }
     a { color: var(--accent); }
     .table-wrap { max-height: 360px; overflow: auto; }
+    .detail-pre { margin: 0; padding: 12px; background: #0b1220; border-radius: 8px;
+                  font-size: 12px; white-space: pre-wrap; word-break: break-all; }
   </style>
 </head>
 <body>
@@ -75,13 +84,33 @@
         <button id="btnStart" class="btn-start">▶ 启动一轮采集</button>
         <button id="btnStop" class="btn-stop" disabled>■ 停止</button>
         <button id="btnDownload" class="btn-download">⬇ 下载 JSON</button>
+        <button id="btnDeliver" class="btn-deliver">📤 交付本轮到分析库</button>
         <a class="btn-site" href="/site/" target="_blank" rel="noopener">🌐 打开本地采购站（新标签页）</a>
         <a class="btn-site" href="/site/admin" target="_blank" rel="noopener">⚙ 采购站限流/延迟开关</a>
+        <a class="btn-site" id="receiverLink" href="http://localhost:8090/" target="_blank" rel="noopener">📥 分析接收端</a>
       </div>
       <p class="muted" style="margin-bottom:0;margin-top:10px">
         目标站点：<span id="baseUrl"></span> ｜ 栏目：招标公告 / 中标公告 ｜ 每页最多尝试 3 次，
         429 按 Retry-After 整站冷却。
       </p>
+      <p class="muted" style="margin-bottom:0;margin-top:6px">
+        交付规则：只有已结束的 completed / partial 轮次可交付；同一轮次固定为一个批次，
+        重复点击、重试与重启均沿用原批次及内容；开始新采集不会改变待交付数据。
+        partial 批次在接收端标记为“不完整”。
+      </p>
+    </section>
+
+    <section class="panel">
+      <h2>交付批次（接收端 SQLite 入库；显示“已交付”前会核实已入库回执）</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>批次</th><th>轮次</th><th>轮次状态</th><th>完整性</th>
+            <th>公告/未完成页</th><th>交付状态</th><th>尝试</th><th>回执号</th>
+            <th>最近错误</th><th>操作</th></tr></thead>
+          <tbody id="batchBody"><tr><td colspan="10" class="muted">暂无批次</td></tr></tbody>
+        </table>
+      </div>
+      <p class="muted" style="margin-bottom:0;margin-top:10px" id="batchHint"></p>
     </section>
 
     <section class="panel">
@@ -199,6 +228,11 @@
       const resp = await fetch("/api/state");
       const s = await resp.json();
       setStatus(s.status);
+      const deliverable = (s.status === "completed" || s.status === "partial");
+      $("btnDeliver").disabled = !deliverable;
+      $("btnDeliver").textContent = deliverable
+        ? "📤 交付本轮到分析库"
+        : "📤 结束可交付的轮次后交付";
       $("baseUrl").textContent = s.base_url;
       $("enqueued").textContent = s.pages_enqueued;
       $("completed").textContent = s.pages_completed;
@@ -213,9 +247,109 @@
       $("events").innerHTML = s.events.slice().reverse().map(e =>
         `<div class="${e.includes("429") || e.includes("unfinished") || e.includes("error") ? "warn" : ""}">${escapeHtml(e)}</div>`).join("");
       await loadRecords();
+      await loadBatches();
       if (s.status !== "running" && s.status !== "stopping" && timer) {
         clearInterval(timer); timer = null;
       }
+    }
+
+    async function loadBatches() {
+      let data;
+      try {
+        const resp = await fetch("/api/deliveries");
+        data = await resp.json();
+      } catch (e) { return; }
+      const body = $("batchBody");
+      if (!data.batches.length) {
+        body.innerHTML = '<tr><td colspan="10" class="muted">暂无批次</td></tr>';
+        $("batchHint").textContent = "";
+        return;
+      }
+      body.innerHTML = data.batches.map(b => {
+        const stateLabel = {
+          pending: "待确认 pending", delivered: "已交付 delivered",
+          rejected: "已拒绝 rejected"
+        }[b.delivery_state] || b.delivery_state;
+        const canRetry = b.delivery_state !== "delivered" && b.delivery_state !== "rejected";
+        const receipt = b.receipt
+          ? `<span class="mono">${escapeHtml(b.receipt.receipt_id)}</span>`
+          : "—";
+        return `<tr class="batch-main" data-batch="${escapeHtml(b.batch_id)}">
+          <td class="mono">${escapeHtml(b.batch_id)}</td>
+          <td class="mono">${escapeHtml(b.round_id)}</td>
+          <td>${escapeHtml(b.round_status)}</td>
+          <td>${b.complete ? "完整" : '<span class="warn">不完整 partial</span>'}</td>
+          <td>${b.records_count} / ${b.unfinished_count}</td>
+          <td><span class="badge ${b.delivery_state}">${escapeHtml(stateLabel)}</span></td>
+          <td>${b.attempts}</td>
+          <td>${receipt}</td>
+          <td class="muted">${b.last_error ? escapeHtml(b.last_error) : "—"}</td>
+          <td>
+            ${canRetry ? `<button class="btn-retry" data-retry="${escapeHtml(b.batch_id)}">重试交付</button>` : ""}
+            <button class="btn-mini" data-verify="${escapeHtml(b.batch_id)}">核实回执</button>
+            <button class="btn-mini" data-detail="${escapeHtml(b.batch_id)}">明细</button>
+            <a class="btn-mini" style="text-decoration:none" href="/api/deliveries/${escapeHtml(b.batch_id)}/content">批次JSON</a>
+          </td></tr>
+          <tr class="batch-detail" id="detail-${escapeHtml(b.batch_id)}" style="display:none">
+          <td colspan="10"><pre class="detail-pre">${escapeHtml(JSON.stringify({
+            batch_id: b.batch_id,
+            round_id: b.round_id,
+            content_hash: b.content_hash,
+            round_status: b.round_status,
+            complete: b.complete,
+            created_at: b.created_at,
+            last_attempt_at: b.last_attempt_at,
+            delivered_at: b.delivered_at,
+            attempts: b.attempts,
+            last_error: b.last_error,
+            records_count: b.records_count,
+            unfinished_count: b.unfinished_count,
+            receipt: b.receipt
+          }, null, 2))}</pre></td></tr>`;
+      }).join("");
+      const pending = data.batches.filter(b => b.delivery_state === "pending").length;
+      const delivered = data.batches.filter(b => b.delivery_state === "delivered").length;
+      $("batchHint").textContent =
+        `共 ${data.batches.length} 个批次：已交付 ${delivered}，待确认 ${pending}。` +
+        `待确认批次会由后台自动重试（网络失败可保持待确认并手动重试）。`;
+    }
+
+    async function deliverCurrent() {
+      $("btnDeliver").disabled = true;
+      try {
+        const resp = await fetch("/api/deliveries", { method: "POST" });
+        if (!resp.ok) { alert("交付失败：" + (await resp.json()).detail); return; }
+        const batch = await resp.json();
+        if (batch.delivery_state === "pending" &&
+            confirm("批次已固定（" + batch.batch_id + "），但回执尚未核实。\n" +
+                    "请到分析接收端确认该批次是否已入库，或稍后重试。")) {
+          // nothing further: the resume loop will retry automatically
+        }
+      } finally {
+        $("btnDeliver").disabled = false;
+        await loadBatches();
+      }
+    }
+
+    async function retryBatch(batchId) {
+      const resp = await fetch(`/api/deliveries/${batchId}/retry`, { method: "POST" });
+      if (!resp.ok) { alert("重试失败：" + (await resp.json()).detail); }
+      await loadBatches();
+    }
+
+    async function verifyBatch(batchId) {
+      const resp = await fetch(`/api/deliveries/${batchId}/refresh`, { method: "POST" });
+      if (!resp.ok) { alert("核实失败：" + (await resp.json()).detail); return; }
+      const b = await resp.json();
+      alert(`批次 ${b.batch_id}：${b.delivery_state}` +
+            (b.receipt ? `\n回执号：${b.receipt.receipt_id}\n入库时间：${b.receipt.received_at}` : ""));
+      await loadBatches();
+    }
+
+    function toggleDetail(batchId) {
+      const row = document.getElementById("detail-" + batchId);
+      if (!row) return;
+      row.style.display = row.style.display === "none" ? "" : "none";
     }
 
     async function start() {
@@ -235,6 +369,18 @@
     $("btnStop").addEventListener("click", stop);
     $("btnDownload").addEventListener("click", () => {
       window.location.href = "/api/records/download";
+    });
+    $("btnDeliver").addEventListener("click", deliverCurrent);
+    fetch("/api/config").then(r => r.json()).then(c => {
+      if (c.receiver_url) $("receiverLink").href = c.receiver_url;
+    }).catch(() => {});
+    $("batchBody").addEventListener("click", (event) => {
+      const retryId = event.target.getAttribute("data-retry");
+      if (retryId) { retryBatch(retryId); return; }
+      const verifyId = event.target.getAttribute("data-verify");
+      if (verifyId) { verifyBatch(verifyId); return; }
+      const detailId = event.target.getAttribute("data-detail");
+      if (detailId) { toggleDetail(detailId); }
     });
     refresh();
     timer = setInterval(refresh, 2000);

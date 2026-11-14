@@ -19,6 +19,27 @@ services:
       timeout: 3s
       retries: 10
 
+  # Local analysis receiver: stores whole batches + receipts in SQLite on a
+  # persistent volume, replays the original receipt, and can be told to drop
+  # the HTTP response after committing (see README).
+  analysis-receiver:
+    build:
+      context: ./receiver
+    container_name: analysis-receiver
+    environment:
+      RECEIVER_DB_PATH: "/data/receiver.db"
+      # Default off; switch at runtime from / or POST /api/admin/drop-response.
+      RECEIVER_DROP_RESPONSE: "${RECEIVER_DROP_RESPONSE:-false}"
+    ports:
+      - "8090:8090"
+    volumes:
+      - receiver-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8090/api/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   collector:
     build:
       context: ./collector
@@ -26,14 +47,29 @@ services:
     depends_on:
       procurement-site:
         condition: service_healthy
+      analysis-receiver:
+        condition: service_healthy
     environment:
       TARGET_BASE_URL: "http://procurement-site:8080"
       SECTION_TENDER_PATH: "/tenders"
       SECTION_AWARD_PATH: "/awards"
+      RECEIVER_BASE_URL: "http://analysis-receiver:8090"
+      # Address the browser should use for the receiver entry link.
+      RECEIVER_PUBLIC_URL: "http://localhost:8090"
+      # Frozen batches and their delivery state survive restarts; on startup
+      # the collector resumes every pending batch.
+      COLLECTOR_DB_PATH: "/data/collector.db"
+      DELIVERY_RETRY_SECONDS: "5"
     ports:
       - "8000:8000"
+    volumes:
+      - collector-data:/data
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
       interval: 5s
       timeout: 3s
       retries: 10
+
+volumes:
+  receiver-data:
+  collector-data:
